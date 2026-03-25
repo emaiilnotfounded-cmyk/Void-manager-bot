@@ -1,13 +1,14 @@
 import os
-import time
-from collections import defaultdict
-
+import yt_dlp
+import asyncio
+from collections import defaultdict, deque
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ContextTypes, filters, CallbackQueryHandler,
+    ChatJoinRequestHandler
 )
 from pymongo import MongoClient
 
@@ -15,182 +16,172 @@ from pymongo import MongoClient
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set")
-
-if not MONGO_URL:
-    raise ValueError("MONGO_URL not set")
-
 # ================= DB =================
 client = MongoClient(MONGO_URL)
-db = client["telegram_bot"]
-users_col = db["users"]
-banwords_col = db["banwords"]
-warns_col = db["warns"]
+db = client["musicbot"]
+welcome_col = db["welcome"]
 
-# ================= MEMORY =================
-user_messages = defaultdict(list)
+# ================= QUEUE =================
+queues = defaultdict(deque)
+now_playing = {}
 
-# ================= ABUSE =================
-AI_ABUSE = ["madarchod","bhosdike","chutiya","randi","fuck","shit"]
+# ================= YT FETCH =================
+async def get_audio(query):
+    ydl_opts = {
+        'format': 'bestaudio',
+        'quiet': True,
+        'noplaylist': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        return info['url'], info.get('title', 'Unknown')
 
-# ================= ADMIN CHECK =================
-async def is_admin(update, context):
-    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-    return update.effective_user.id in [a.user.id for a in admins]
+# ================= PLAY NEXT =================
+async def play_next(chat_id, context):
+    if queues[chat_id]:
+        query = queues[chat_id].popleft()
+        audio_url, title = await get_audio(query)
 
-# ================= SAVE USER =================
-def save_user(user):
-    if user.username:
-        users_col.update_one(
-            {"username": user.username.lower()},
-            {"$set": {"user_id": user.id}},
-            upsert=True
+        now_playing[chat_id] = title
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⏸", callback_data="pause"),
+                InlineKeyboardButton("⏭", callback_data="skip")
+            ],
+            [
+                InlineKeyboardButton("⏹", callback_data="stop"),
+                InlineKeyboardButton("❌", callback_data="close")
+            ]
+        ])
+
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=audio_url,
+            title=title,
+            reply_markup=keyboard
         )
-
-def get_user_id(username):
-    data = users_col.find_one({"username": username.lower()})
-    return data["user_id"] if data else None
+    else:
+        now_playing.pop(chat_id, None)
 
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Me", url="https://t.me/yourbot?startgroup=true")],
-        [InlineKeyboardButton("📚 Help", callback_data="help")]
-    ]
+    await update.message.reply_text("🎵 Advanced Music Bot Active!")
 
-    text = "Hey! I'm VOID Manager Bot 🚀"
+# ================= PLAY =================
+async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
 
-    if update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /play song name or link")
+        return
+
+    query = " ".join(context.args)
+    queues[chat_id].append(query)
+
+    if chat_id not in now_playing:
+        await play_next(chat_id, context)
     else:
-        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text("➕ Added to queue!")
+
+# ================= STOP =================
+async def stopmusic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
+    queues[chat_id].clear()
+    now_playing.pop(chat_id, None)
+    await update.message.reply_text("⏹ Stopped & queue cleared!")
 
 # ================= BUTTONS =================
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    chat_id = query.message.chat.id
     await query.answer()
 
-    if query.data == "help":
-        await query.edit_message_text("Use commands:\n/mute\n/ban\n/warn\n/addbanword")
+    if query.data == "skip":
+        await query.message.reply_text("⏭ Skipping...")
+        await play_next(chat_id, context)
 
-# ================= ID =================
-async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message:
-        u = update.message.reply_to_message.from_user
-        return await update.message.reply_text(f"{u.first_name}\nID: {u.id}")
+    elif query.data == "stop":
+        queues[chat_id].clear()
+        now_playing.pop(chat_id, None)
+        await query.message.reply_text("⏹ Stopped")
 
-    await update.message.reply_text(f"Your ID: {update.effective_user.id}")
+    elif query.data == "close":
+        await query.message.delete()
 
-# ================= MUTE =================
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return await update.message.reply_text("Admins only")
+    elif query.data == "pause":
+        await query.answer("⏸ Pause not supported in audio mode")
 
-    if update.message.reply_to_message:
-        uid = update.message.reply_to_message.from_user.id
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, uid,
-            permissions=ChatPermissions(can_send_messages=False)
-        )
-        await update.message.reply_text("Muted 🔇")
+# ================= SET WELCOME =================
+async def setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
 
-# ================= BAN =================
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return await update.message.reply_text("Admins only")
+    if not context.args:
+        await update.message.reply_text("Usage: /setwelcome text")
+        return
 
-    if update.message.reply_to_message:
-        uid = update.message.reply_to_message.from_user.id
-        await context.bot.ban_chat_member(update.effective_chat.id, uid)
-        await update.message.reply_text("Banned 🔨")
-
-# ================= WARN =================
-async def warn_user(chat_id, uid, context):
-    warns_col.update_one({"user": uid}, {"$inc": {"warns": 1}}, upsert=True)
-    w = warns_col.find_one({"user": uid})["warns"]
-
-    await context.bot.send_message(chat_id, f"⚠️ Warn {w}/3")
-
-    if w >= 3:
-        await context.bot.ban_chat_member(chat_id, uid)
-        await context.bot.send_message(chat_id, "❌ Banned (3 warns)")
-
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return await update.message.reply_text("Admins only")
-
-    if update.message.reply_to_message:
-        await warn_user(
-            update.effective_chat.id,
-            update.message.reply_to_message.from_user.id,
-            context
-        )
-
-# ================= BANWORDS =================
-async def add_banword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return await update.message.reply_text("Admins only")
-
-    banwords_col.update_one(
-        {"word": context.args[0]},
-        {"$set": {"word": context.args[0]}},
+    text = " ".join(context.args)
+    welcome_col.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"text": text}},
         upsert=True
     )
-    await update.message.reply_text("Added")
 
-async def remove_banword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return await update.message.reply_text("Admins only")
+    await update.message.reply_text("✅ Welcome saved!")
 
-    banwords_col.delete_one({"word": context.args[0]})
-    await update.message.reply_text("Removed")
+# ================= WELCOME =================
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat.id
+    data = welcome_col.find_one({"chat_id": chat_id})
 
-# ================= AI MODERATION =================
-async def ai_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    save_user(user)
+    if data:
+        await update.message.reply_text(data["text"])
 
-    text = (update.message.text or "").lower()
-    uid = user.id
+# ================= JOIN REQUEST =================
+async def join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.chat_join_request.from_user
+    chat_id = update.chat_join_request.chat.id
 
-    for word in AI_ABUSE:
-        if word in text:
-            await update.message.delete()
-            await warn_user(update.effective_chat.id, uid, context)
-            return
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user.id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user.id}")
+        ]
+    ])
 
-    for w in [x["word"] for x in banwords_col.find()]:
-        if w in text:
-            await update.message.delete()
-            await warn_user(update.effective_chat.id, uid, context)
-            return
+    await context.bot.send_message(
+        chat_id,
+        f"👤 Join Request: {user.first_name}",
+        reply_markup=keyboard
+    )
 
-    now = time.time()
-    user_messages[uid] = [t for t in user_messages[uid] if now - t < 5]
-    user_messages[uid].append(now)
+# ================= APPROVE / REJECT =================
+async def approve_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
 
-    if len(user_messages[uid]) >= 5:
-        await warn_user(update.effective_chat.id, uid, context)
+    user_id = int(data.split("_")[1])
+    chat_id = query.message.chat.id
+
+    if "approve" in data:
+        await context.bot.approve_chat_join_request(chat_id, user_id)
+        await query.edit_message_text("✅ Approved")
+    else:
+        await context.bot.decline_chat_join_request(chat_id, user_id)
+        await query.edit_message_text("❌ Rejected")
 
 # ================= MAIN =================
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("id", id_command))
-    app.add_handler(CommandHandler("warn", warn))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("ban", ban))
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("play", play))
+app.add_handler(CommandHandler("stopmusic", stopmusic))
+app.add_handler(CommandHandler("setwelcome", setwelcome))
 
-    app.add_handler(CommandHandler("addbanword", add_banword))
-    app.add_handler(CommandHandler("removebanword", remove_banword))
+app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+app.add_handler(ChatJoinRequestHandler(join_request))
+app.add_handler(CallbackQueryHandler(approve_reject, pattern="approve|reject"))
+app.add_handler(CallbackQueryHandler(buttons))
 
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_moderation))
-
-    print("🔥 VOID BOT RUNNING WITHOUT CAPTCHA...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+print("🔥 Advanced Bot Running...")
+app.run_polling()
